@@ -1,0 +1,17 @@
+build
+doc
+docSrc
+examples
+libs
+framework
+resources
+solutionInterface
+teacherSolutionBinary
+
+Doxyfile
+*.bin
+*.exe
+*.html
+*.cmake
+*.txt
+*.sh
