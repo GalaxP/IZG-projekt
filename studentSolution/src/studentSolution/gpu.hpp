@@ -18,10 +18,3 @@
  * @param cb command buffer - packaged of work sent to the gpu
  */
 void student_GPU_run(GPUMemory&mem,CommandBuffer const&cb);
-
-enum BufferType{
-  COLOR,
-  DEPTH,
-  STENCIL
-};
-void clear_buffer(GPUMemory& mem, glm::vec4 value, BufferType type);

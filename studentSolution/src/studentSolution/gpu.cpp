@@ -10,6 +10,14 @@
 #include <cstring>
 
 
+enum BufferType{
+  COLOR,
+  DEPTH,
+  STENCIL
+};
+void clear_buffer(GPUMemory& mem, glm::vec4 value, BufferType type);
+
+
 //! [student_GPU_run]
 void student_GPU_run(GPUMemory&mem,CommandBuffer const&cb){
   (void)mem;
