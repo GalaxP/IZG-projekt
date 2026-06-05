@@ -21,7 +21,7 @@ void renderMethodFrame(Framebuffer&frame){
 
   GPUMemory mem;
   mem.framebuffers[mem.defaultFramebuffer] = frame;
-  auto method = mr.methodFactories[sm](mem,&*mr.methodConstructData[sm]);
+  auto method = mr.methodFactories[sm](mem,mr.methodConstructData[sm].get());
 
   auto orbitCamera       = basicCamera::OrbitCamera();
   auto perspectiveCamera = basicCamera::PerspectiveCamera();

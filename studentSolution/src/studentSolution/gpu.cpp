@@ -11,7 +11,7 @@
 #include <vector>
 #include <cmath>
 #include <fstream>
-
+#include <array>
 
 enum BufferType{
   COLOR,
@@ -22,11 +22,16 @@ struct Triangle{
   OutVertex vertex[3];
   uint32_t id;
 };
+struct ClippedPrimitive {
+  Triangle triangles[2];
+  uint32_t nofTriangles;
+};
 void clear_buffer(GPUMemory& mem, glm::vec4 value, BufferType type);
 void primitiveAssembly(GPUMemory& mem, Triangle &t, uint32_t program);
 void viewPortTransformation(Triangle& primitive, Framebuffer& framebuffer);
 void rasterize(Framebuffer& framebuffer, Triangle& primitive, FragmentShader fragmentShader, GPUMemory& mem);
 static float edge_function(const glm::vec2& a, const glm::vec2& b, const glm::vec2& p);
+void perform_clipping(ClippedPrimitive& out, Triangle const& in, Program const& program);
 
 
 //! [student_GPU_run]
@@ -124,10 +129,15 @@ void student_GPU_run(GPUMemory&mem,CommandBuffer const&cb){
             }
           }
 
-          viewPortTransformation(primitive, mem.framebuffers[mem.activatedFramebuffer]);
-          // rasterize the primitive with the current program's fragment shader
-          FragmentShader fs = mem.programs[mem.activatedProgram].fragmentShader;
-          rasterize(mem.framebuffers[mem.activatedFramebuffer], primitive, fs, mem);
+          ClippedPrimitive clippedPrimitive;
+          perform_clipping(clippedPrimitive, primitive, mem.programs[mem.activatedProgram]);
+
+          for(uint32_t i = 0; i < clippedPrimitive.nofTriangles; i++){
+            Triangle& clipped_primitive = clippedPrimitive.triangles[i];
+            viewPortTransformation(clipped_primitive, mem.framebuffers[mem.activatedFramebuffer]);
+            FragmentShader fs = mem.programs[mem.activatedProgram].fragmentShader;
+            rasterize(mem.framebuffers[mem.activatedFramebuffer], clipped_primitive, fs, mem);
+          }
         }
 
         mem.gl_DrawID++;
@@ -153,6 +163,128 @@ static uint8_t apply_stencil_op(uint8_t current, StencilOp op, uint32_t ref){
     case StencilOp::INVERT: return static_cast<uint8_t>(~current);
   }
   return current;
+}
+
+Attrib interpolate_attribute(
+    Attrib const& a,
+    Attrib const& b,
+    float t,
+    AttribType type
+) {
+  Attrib out{};
+
+  switch (type) {
+    case AttribType::EMPTY:
+      break;
+    case AttribType::FLOAT:
+      out.v1 = a.v1 + t * (b.v1 - a.v1);
+      break;
+    case AttribType::VEC2:
+      out.v2 = a.v2 + t * (b.v2 - a.v2);
+      break;
+    case AttribType::VEC3:
+      out.v3 = a.v3 + t * (b.v3 - a.v3);
+      break;
+    case AttribType::VEC4:
+      out.v4 = a.v4 + t * (b.v4 - a.v4);
+      break;
+  }
+
+  return out;
+}
+
+
+OutVertex interpolate_vertex(
+    OutVertex const& a,
+    OutVertex const& b,
+    float t,
+    Program const& program
+) {
+  OutVertex out{};
+  out.gl_Position = a.gl_Position + t * (b.gl_Position - a.gl_Position);
+
+  for (uint32_t i = 0; i < maxAttribs; ++i) {
+    out.attributes[i] = interpolate_attribute(
+        a.attributes[i],
+        b.attributes[i],
+        t,
+        program.vs2fs[i]
+    );
+  }
+
+  return out;
+}
+
+float near_plane_dist(OutVertex const& v) {
+  return v.gl_Position.z + v.gl_Position.w;
+}
+
+bool is_inside_near_plane(OutVertex const& v) {
+  return near_plane_dist(v) >= 0.f;
+}
+
+OutVertex intersect_near_plane(OutVertex const& a,OutVertex const& b,Program const& program
+) {
+  float da = near_plane_dist(a);
+  float db = near_plane_dist(b);
+
+  float t = da / (da - db);
+
+  return interpolate_vertex(a, b, t, program);
+}
+
+void perform_clipping(ClippedPrimitive& out, Triangle const& in, Program const& program) {
+  out.nofTriangles = 0;
+
+  std::array<OutVertex, 4> poly{};
+  uint32_t polyCount = 0;
+
+  auto push_vertex = [&](OutVertex const& v) {
+    poly[polyCount++] = v;
+  };
+
+  for (uint32_t i = 0; i < 3; ++i) {
+    OutVertex const& a = in.vertex[i];
+    OutVertex const& b = in.vertex[(i + 1) % 3];
+
+    bool aInside = is_inside_near_plane(a);
+    bool bInside = is_inside_near_plane(b);
+
+    if (aInside && bInside) {
+      push_vertex(b);
+    } else if (aInside && !bInside) {
+      push_vertex(intersect_near_plane(a, b, program));
+    } else if (!aInside && bInside) {
+      push_vertex(intersect_near_plane(a, b, program));
+      push_vertex(b);
+    }
+  }
+
+  if (polyCount < 3) {
+    out.nofTriangles = 0;
+    return;
+  }
+
+  if (polyCount == 3) {
+    out.triangles[0].vertex[0] = poly[0];
+    out.triangles[0].vertex[1] = poly[1];
+    out.triangles[0].vertex[2] = poly[2];
+    out.nofTriangles = 1;
+    return;
+  }
+
+  if (polyCount == 4) {
+    out.triangles[0].vertex[0] = poly[0];
+    out.triangles[0].vertex[1] = poly[1];
+    out.triangles[0].vertex[2] = poly[2];
+
+    out.triangles[1].vertex[0] = poly[0];
+    out.triangles[1].vertex[1] = poly[2];
+    out.triangles[1].vertex[2] = poly[3];
+
+    out.nofTriangles = 2;
+    return;
+  }
 }
 
 void viewPortTransformation(Triangle& primitive, Framebuffer& framebuffer){
@@ -332,19 +464,15 @@ void create_fragment(InFragment& inFragment, Triangle& primitive, glm::vec3 bary
     }
   }
 
-  // compute perspective-correct depth
   float ndc0 = primitive.vertex[0].gl_Position.z; // already divided by w in viewPortTransformation
   float ndc1 = primitive.vertex[1].gl_Position.z;
   float ndc2 = primitive.vertex[2].gl_Position.z;
   float numZ = ndc0 * barycentrics.x + ndc1 * barycentrics.y + ndc2 * barycentrics.z;
-  // use linear NDC z (tests expect this form)
   float depth = numZ;
   inFragment.gl_FragCoord = glm::vec4(pixelCoord, depth, 1.f);
 }
 
 void rasterize(Framebuffer& framebuffer, Triangle& primitive, FragmentShader fragmentShader, GPUMemory& mem) {
-  // Simple rasterize: compute barycentrics, construct fragment, call fragment shader
-  // precompute triangle area and facing
   float triArea = edge_function(primitive.vertex[0].gl_Position, primitive.vertex[1].gl_Position, primitive.vertex[2].gl_Position);
   bool frontIsCCW = mem.backfaceCulling.frontFaceIsCounterClockWise;
   bool triangleIsFront = (triArea < 0.0f && frontIsCCW) || (triArea > 0.0f && !frontIsCCW);
@@ -381,49 +509,13 @@ void rasterize(Framebuffer& framebuffer, Triangle& primitive, FragmentShader fra
       float invArea = 1.0f / triArea;
       glm::vec3 barycentrics = glm::vec3(w0 * invArea, w1 * invArea, w2 * invArea);
 
-      // STENCIL TEST (before fragment shader)
-      if(mem.stencilSettings.enabled && framebuffer.stencil.data != nullptr){
-        uint8_t* sptr = (uint8_t*)getPixel(framebuffer.stencil, x, y);
-        uint8_t sval = sptr[0];
-        uint32_t ref = mem.stencilSettings.refValue;
-        bool stencilPass = true;
-        switch(mem.stencilSettings.func){
-          case StencilFunc::NEVER:    stencilPass = false; break;
-          case StencilFunc::LESS:     stencilPass = sval < ref; break;
-          case StencilFunc::LEQUAL:   stencilPass = sval <= ref; break;
-          case StencilFunc::GREATER:  stencilPass = sval > ref; break;
-          case StencilFunc::GEQUAL:   stencilPass = sval >= ref; break;
-          case StencilFunc::EQUAL:    stencilPass = sval == ref; break;
-          case StencilFunc::NOTEQUAL: stencilPass = sval != ref; break;
-          case StencilFunc::ALWAYS:   stencilPass = true; break;
-        }
-        if(!stencilPass){
-          // apply sfail
-          StencilOp op = triangleIsFront ? mem.stencilSettings.frontOps.sfail : mem.stencilSettings.backOps.sfail;
-          if(!mem.blockWrites.stencil){
-            sptr[0] = apply_stencil_op(sval, op, mem.stencilSettings.refValue);
-          }
-          continue;
-        }
-      }
-
+      // Compute fragment depth for early depth test
       InFragment inFragment;
       create_fragment(inFragment, primitive, barycentrics, p, mem.programs[mem.activatedProgram]);
-      OutFragment outFragment;
-      ShaderInterface si;
-      si.uniforms = mem.uniforms;
-      si.textures = mem.textures;
-      si.gl_DrawID = mem.gl_DrawID;
-      if(fragmentShader != nullptr) fragmentShader(outFragment, inFragment, si);
-
-      // Respect fragment discard from shader
-      if(outFragment.discard) continue;
-
-      // DEPTH TEST + WRITE: compare fragment depth against depth buffer and
-      // write new depth if it passes (honoring blockWrites.depth). Use <=
-      // comparison to match expected test semantics.
-      bool depthExists = framebuffer.depth.data != nullptr;
       float fragDepth = inFragment.gl_FragCoord.z;
+
+      // Early DEPTH TEST (before fragment shader and stencil test)
+      bool depthExists = framebuffer.depth.data != nullptr;
       bool depthPass = true;
       if(depthExists){
         Image &dimg = framebuffer.depth;
@@ -461,6 +553,43 @@ void rasterize(Framebuffer& framebuffer, Triangle& primitive, FragmentShader fra
           sptr[0] = apply_stencil_op(sval, op, mem.stencilSettings.refValue);
         }
       }
+
+      // STENCIL TEST (after depth pass, before fragment shader)
+      if(mem.stencilSettings.enabled && framebuffer.stencil.data != nullptr){
+        uint8_t* sptr = (uint8_t*)getPixel(framebuffer.stencil, x, y);
+        uint8_t sval = sptr[0];
+        uint32_t ref = mem.stencilSettings.refValue;
+        bool stencilPass = true;
+        switch(mem.stencilSettings.func){
+          case StencilFunc::NEVER:    stencilPass = false; break;
+          case StencilFunc::LESS:     stencilPass = sval < ref; break;
+          case StencilFunc::LEQUAL:   stencilPass = sval <= ref; break;
+          case StencilFunc::GREATER:  stencilPass = sval > ref; break;
+          case StencilFunc::GEQUAL:   stencilPass = sval >= ref; break;
+          case StencilFunc::EQUAL:    stencilPass = sval == ref; break;
+          case StencilFunc::NOTEQUAL: stencilPass = sval != ref; break;
+          case StencilFunc::ALWAYS:   stencilPass = true; break;
+        }
+        if(!stencilPass){
+          // apply sfail
+          StencilOp op = triangleIsFront ? mem.stencilSettings.frontOps.sfail : mem.stencilSettings.backOps.sfail;
+          if(!mem.blockWrites.stencil){
+            sptr[0] = apply_stencil_op(sval, op, mem.stencilSettings.refValue);
+          }
+          continue;
+        }
+      }
+
+      // fragment shader
+      OutFragment outFragment;
+      ShaderInterface si;
+      si.uniforms = mem.uniforms;
+      si.textures = mem.textures;
+      si.gl_DrawID = mem.gl_DrawID;
+      if(fragmentShader != nullptr) fragmentShader(outFragment, inFragment, si);
+
+      // Respect fragment discard from shader
+      if(outFragment.discard) continue;
 
       // If depth buffer exists and depth writes are not blocked, write fragDepth.
       if(depthExists && !mem.blockWrites.depth){
@@ -531,11 +660,8 @@ void rasterize(Framebuffer& framebuffer, Triangle& primitive, FragmentShader fra
           (void)sF; (void)dF; // suppress unused warning if blending disabled in future
           switch(mem.blendingSettings.equation){
             case BlendEquation::ADD: result = src * sF + dst * dF; break;
-            // Note: Swap SUBTRACT and REVERSE_SUBTRACT implementations to match
-            // reference behavior used by the test-suite (teacher solution).
-            // SUBTRACT in tests behaves as (dst * dF - src * sF).
-            case BlendEquation::SUBTRACT: result = dst * dF - src * sF; break;
-            case BlendEquation::REVERSE_SUBTRACT: result = src * sF - dst * dF; break;
+            case BlendEquation::SUBTRACT: result = src * sF - dst * dF; break;
+            case BlendEquation::REVERSE_SUBTRACT: result = dst * dF - src * sF; break;
             case BlendEquation::MIN: result = glm::min(src, dst); break;
             case BlendEquation::MAX: result = glm::max(src, dst); break;
           }
